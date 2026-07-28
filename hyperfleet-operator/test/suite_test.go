@@ -15,7 +15,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	hyperfleetdb "github.com/openshift-online/rosa-hyperfleet-api/hyperfleet-db"
@@ -207,14 +206,8 @@ var _ = BeforeSuite(func() {
 	// ── DynamoDB Streams ──
 
 	By("starting DynamoDB status stream watchers")
-	streamsClient := dynamodbstreams.NewFromConfig(aws.Config{
-		Region:       "us-east-1",
-		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", "test"),
-		BaseEndpoint: aws.String(fmt.Sprintf("http://127.0.0.1:%s", ddbPort)),
-	})
 	streamMgr := statusstream.NewManager(
 		dynamoDBCli,
-		streamsClient,
 		mgr.GetClient(),
 		[]string{dynamo.TableSuffixStatusApplyDesires, dynamo.TableSuffixStatusReadDesires},
 		func(documentID string) { eventRouter.Dispatch(documentID) },
@@ -374,12 +367,6 @@ func createTables(db *dynamodb.Client) {
 					},
 				},
 				BillingMode: dynamodbtypes.BillingModePayPerRequest,
-			}
-			if prefix == mc+"-status" {
-				input.StreamSpecification = &dynamodbtypes.StreamSpecification{
-					StreamEnabled:  aws.Bool(true),
-					StreamViewType: dynamodbtypes.StreamViewTypeNewAndOldImages,
-				}
 			}
 			_, err := db.CreateTable(context.Background(), input)
 			Expect(err).NotTo(HaveOccurred(), "create table %s", tableName)

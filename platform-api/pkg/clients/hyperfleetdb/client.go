@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	awsdynamodb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	hyperfleetdb "github.com/openshift-online/rosa-hyperfleet-api/hyperfleet-db"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,7 +18,7 @@ import (
 
 const accountIDLabel = "hyperfleet.io/account-id"
 
-// Client wraps a pgruntime client.Client for CRUD on hyperfleet resources.
+// Client wraps a hyperfleetdb client.Client for CRUD on hyperfleet resources.
 type Client struct {
 	client client.Client
 	close  func()
@@ -26,18 +27,19 @@ type Client struct {
 
 // NewClient creates a Client backed by hyperfleetdb.NewClient.
 // The direct client is never sharded and sees all data.
-func NewClient(ctx context.Context, dsn string, logger *slog.Logger) (*Client, error) {
+func NewClient(_ context.Context, ddb *awsdynamodb.Client, tablePrefix string, logger *slog.Logger) (*Client, error) {
 	scheme := runtime.NewScheme()
 	if err := hyperfleetv1alpha1.AddToScheme(scheme); err != nil {
 		return nil, fmt.Errorf("register hyperfleet scheme: %w", err)
 	}
 
 	c, cleanup, err := hyperfleetdb.NewClient(hyperfleetdb.Options{
-		Scheme: scheme,
-		DSN:    dsn,
+		Scheme:      scheme,
+		DynamoDB:    ddb,
+		TablePrefix: tablePrefix,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create pgruntime client: %w", err)
+		return nil, fmt.Errorf("create hyperfleetdb client: %w", err)
 	}
 
 	return &Client{client: c, close: cleanup, logger: logger}, nil

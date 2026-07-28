@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awsdynamodb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/spf13/cobra"
 
 	"github.com/openshift-online/rosa-hyperfleet-api/platform-api/pkg/clients/hyperfleetdb"
@@ -22,9 +23,9 @@ var (
 	logLevel          string
 	logFormat         string
 	allowedAccounts   string
-	postgresDSN       string
 	dynamodbRegion    string
 	dynamodbPrefix    string
+	hyperfleetPrefix  string
 	oidcIssuerBaseURL string
 	apiPort           int
 	healthPort        int
@@ -54,9 +55,9 @@ func init() {
 	serveCmd.Flags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	serveCmd.Flags().StringVar(&logFormat, "log-format", "json", "Log format (json, text)")
 	serveCmd.Flags().StringVar(&allowedAccounts, "allowed-accounts", "", "Comma-separated list of allowed AWS account IDs")
-	serveCmd.Flags().StringVar(&postgresDSN, "postgres-dsn", "", "PostgreSQL connection string (required)")
 	serveCmd.Flags().StringVar(&dynamodbRegion, "dynamodb-region", "", "AWS region for DynamoDB (defaults to auto-detected region)")
-	serveCmd.Flags().StringVar(&dynamodbPrefix, "dynamodb-prefix", "rosa", "Prefix for DynamoDB table names")
+	serveCmd.Flags().StringVar(&dynamodbPrefix, "dynamodb-prefix", "rosa", "Prefix for DynamoDB table names (authz/ZOA tables)")
+	serveCmd.Flags().StringVar(&hyperfleetPrefix, "hyperfleet-table-prefix", "", "Prefix for hyperfleet CRD DynamoDB tables (required)")
 	serveCmd.Flags().StringVar(&oidcIssuerBaseURL, "oidc-issuer-base-url", "", "Base URL for OIDC issuer (e.g. https://<cloudfront-domain>)")
 	serveCmd.Flags().IntVar(&apiPort, "api-port", 8000, "API server port")
 	serveCmd.Flags().IntVar(&healthPort, "health-port", 8080, "Health check server port")
@@ -88,13 +89,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	cfg := config.NewConfig()
 	cfg.Logging.Level = logLevel
 	cfg.Logging.Format = logFormat
-	if postgresDSN == "" {
-		postgresDSN = os.Getenv("POSTGRES_DSN")
+
+	// Validate required flags
+	if hyperfleetPrefix == "" {
+		hyperfleetPrefix = os.Getenv("HYPERFLEET_DB_TABLE_PREFIX")
 	}
-	if postgresDSN == "" {
-		return fmt.Errorf("--postgres-dsn or POSTGRES_DSN is required")
+	if hyperfleetPrefix == "" {
+		return fmt.Errorf("--hyperfleet-table-prefix or HYPERFLEET_DB_TABLE_PREFIX is required")
 	}
-	cfg.DB.DSN = postgresDSN
 
 	cfg.Regional.OIDCIssuerBaseURL = oidcIssuerBaseURL
 	cfg.AllowedAccounts = parseAllowedAccounts(allowedAccounts)
@@ -164,8 +166,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		)
 	}
 
-	// Create hyperfleet DB client (Postgres via pgruntime)
-	dbClient, err := hyperfleetdb.NewClient(context.Background(), cfg.DB.DSN, logger)
+	// Create hyperfleet DB client (DynamoDB-backed)
+	hfDDB := awsdynamodb.NewFromConfig(awsCfg)
+	dbClient, err := hyperfleetdb.NewClient(context.Background(), hfDDB, hyperfleetPrefix, logger)
 	if err != nil {
 		return fmt.Errorf("failed to create hyperfleetdb client: %w", err)
 	}

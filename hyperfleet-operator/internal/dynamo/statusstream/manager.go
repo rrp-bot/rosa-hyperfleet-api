@@ -7,22 +7,23 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	hyperfleetv1alpha1 "github.com/openshift-online/rosa-hyperfleet-api/hyperfleet-operator/api/v1alpha1"
 )
 
 type watcherHandle struct {
-	cancel context.CancelFunc
+	watcher *PollWatcher
+	cancel  context.CancelFunc
 }
 
-// Manager discovers management clusters and runs one Watcher per MC per
-// table suffix. It polls the MC list periodically to start watchers for
-// new MCs and stop watchers for removed MCs.
+// Manager discovers management clusters and runs one PollWatcher per MC per
+// table suffix. It polls the MC list periodically to start watchers for new
+// MCs and stop watchers for removed MCs. Watchers that close after their
+// watchDuration are automatically restarted, providing the unconditional
+// relist guarantee.
 type Manager struct {
 	dbClient      *dynamodb.Client
-	streamsClient *dynamodbstreams.Client
 	mcReader      client.Reader
 	tableSuffixes []string
 	onChange      OnChange
@@ -31,7 +32,6 @@ type Manager struct {
 
 func NewManager(
 	dbClient *dynamodb.Client,
-	streamsClient *dynamodbstreams.Client,
 	mcReader client.Reader,
 	tableSuffixes []string,
 	onChange OnChange,
@@ -39,7 +39,6 @@ func NewManager(
 ) *Manager {
 	return &Manager{
 		dbClient:      dbClient,
-		streamsClient: streamsClient,
 		mcReader:      mcReader,
 		tableSuffixes: tableSuffixes,
 		onChange:      onChange,
@@ -47,14 +46,15 @@ func NewManager(
 	}
 }
 
-// Run blocks until ctx is canceled. It polls the MC list every interval
-// and ensures one Watcher goroutine runs per MC.
+// Run blocks until ctx is canceled. It polls the MC list every interval and
+// ensures one PollWatcher goroutine runs per (MC, table suffix) pair.
+// Watchers that naturally close (watchDuration elapsed) are restarted.
 func (m *Manager) Run(ctx context.Context, interval time.Duration) {
 	active := make(map[string]watcherHandle)
 
 	defer func() {
-		for _, w := range active {
-			w.cancel()
+		for _, h := range active {
+			h.cancel()
 		}
 	}()
 
@@ -87,10 +87,11 @@ func (m *Manager) syncWatchers(ctx context.Context, active map[string]watcherHan
 		}
 	}
 
-	for key, entry := range active {
+	// Stop watchers for removed MCs.
+	for key, h := range active {
 		if _, ok := desired[key]; !ok {
-			m.logger.Info("stopping status stream watcher", "key", key)
-			entry.cancel()
+			m.logger.Info("stopping status poll watcher", "key", key)
+			h.cancel()
 			delete(active, key)
 		}
 	}
@@ -101,15 +102,28 @@ func (m *Manager) syncWatchers(ctx context.Context, active map[string]watcherHan
 		}
 		for _, suffix := range m.tableSuffixes {
 			key := mc.Name + suffix
-			if _, ok := active[key]; ok {
-				continue
-			}
 			tableName := mc.Name + suffix
-			watcher := NewWatcher(m.dbClient, m.streamsClient, tableName, m.onChange, m.logger)
+
+			h, running := active[key]
+			if running {
+				// Check if the watcher exited naturally (watchDuration elapsed).
+				select {
+				case <-h.watcher.Done():
+					m.logger.Info("restarting poll watcher after watchDuration", "key", key)
+					h.cancel()
+					delete(active, key)
+				default:
+					// Still running — nothing to do.
+					continue
+				}
+			}
+
+			// Start a new watcher.
 			watcherCtx, cancel := context.WithCancel(ctx)
-			active[key] = watcherHandle{cancel: cancel}
-			m.logger.Info("starting status stream watcher", "mc", mc.Name, "table", tableName)
-			go watcher.Run(watcherCtx)
+			pw := NewPollWatcher(m.dbClient, tableName, m.onChange, m.logger)
+			active[key] = watcherHandle{watcher: pw, cancel: cancel}
+			m.logger.Info("starting status poll watcher", "mc", mc.Name, "table", tableName)
+			go pw.Run(watcherCtx)
 		}
 	}
 }

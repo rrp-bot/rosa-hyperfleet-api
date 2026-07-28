@@ -6,16 +6,42 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/openshift-online/rosa-hyperfleet-api/hyperfleet-db/internal/model"
-	"github.com/openshift-online/rosa-hyperfleet-api/hyperfleet-db/internal/resourceversion"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/google/uuid"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
+	apitypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// DynamoDB attribute names for the CRD table schema.
+const (
+	attrName             = "name"
+	attrNamespace        = "namespace"
+	attrUID              = "uid"
+	attrObjectVersion    = "objectVersion"
+	attrUpdateTime       = "updateTime"
+	attrGSIShard         = "gsiShard"
+	attrCreateTime       = "createTime"
+	attrSpec             = "spec"
+	attrStatus           = "status"
+	attrMetadata         = "metadata"
+	attrDeletionTS       = "deletionTimestamp"
+	attrTTL              = "ttl"
+
+	gsiShardCount = 8 // number of GSI shard buckets for the updateTime-index
+)
+
+// GSIName is the name of the updateTime-index GSI on every CRD table.
+const GSIName = "updateTime-index"
+
+// storedMetadata is the JSON shape stored in the metadata DynamoDB attribute.
 type storedMetadata struct {
 	Labels          map[string]string       `json:"labels,omitempty"`
 	Annotations     map[string]string       `json:"annotations,omitempty"`
@@ -23,6 +49,37 @@ type storedMetadata struct {
 	Finalizers      []string                `json:"finalizers,omitempty"`
 	Generation      int64                   `json:"generation,omitempty"`
 }
+
+// crdItem is the in-memory representation of a DynamoDB CRD item.
+type crdItem struct {
+	Name              string
+	Namespace         string
+	UID               string
+	ObjectVersion     int64
+	UpdateTime        time.Time
+	CreateTime        time.Time
+	Spec              json.RawMessage
+	Status            json.RawMessage
+	Metadata          json.RawMessage
+	DeletionTimestamp *time.Time
+}
+
+func (it *crdItem) hasFinalizers() bool {
+	if len(it.Metadata) == 0 {
+		return false
+	}
+	var sm storedMetadata
+	if err := json.Unmarshal(it.Metadata, &sm); err != nil {
+		return false
+	}
+	return len(sm.Finalizers) > 0
+}
+
+func (it *crdItem) isFullyDeleted() bool {
+	return it.DeletionTimestamp != nil && !it.hasFinalizers()
+}
+
+// --- GVK / scheme helpers ---
 
 func gvkToString(gvk schema.GroupVersionKind) string {
 	return fmt.Sprintf("%s/%s/%s", gvk.Group, gvk.Version, gvk.Kind)
@@ -55,6 +112,258 @@ func itemGVKFromListGVK(gvk schema.GroupVersionKind) schema.GroupVersionKind {
 	}
 }
 
+func buildRESTMapper(s *runtime.Scheme) apimeta.RESTMapper {
+	mapper := apimeta.NewDefaultRESTMapper(s.PrioritizedVersionsAllGroups())
+	for gvk := range s.AllKnownTypes() {
+		if strings.HasSuffix(gvk.Kind, "List") || gvk.Kind == "" {
+			continue
+		}
+		mapper.Add(gvk, apimeta.RESTScopeNamespace)
+	}
+	return mapper
+}
+
+// --- Table name helpers ---
+
+// tableForGVK returns the DynamoDB table name for a given GVK and prefix.
+// E.g. "rc01-" + Cluster → "rc01-clusters".
+func tableForGVK(prefix string, gvk schema.GroupVersionKind) (string, error) {
+	suffix, err := tableSuffixForKind(gvk.Kind)
+	if err != nil {
+		return "", err
+	}
+	return prefix + suffix, nil
+}
+
+func tableSuffixForKind(kind string) (string, error) {
+	switch kind {
+	case "Cluster":
+		return "clusters", nil
+	case "ClusterList":
+		return "clusters", nil
+	case "NodePool":
+		return "nodepools", nil
+	case "NodePoolList":
+		return "nodepools", nil
+	case "Placement":
+		return "placements", nil
+	case "PlacementList":
+		return "placements", nil
+	case "Manifest":
+		return "manifests", nil
+	case "ManifestList":
+		return "manifests", nil
+	case "ManagementCluster":
+		return "managementclusters", nil
+	case "ManagementClusterList":
+		return "managementclusters", nil
+	default:
+		return "", fmt.Errorf("hyperfleetdb: no table mapping for kind %q", kind)
+	}
+}
+
+// --- DynamoDB ↔ object marshalling ---
+
+// objectToItem converts a client.Object into a DynamoDB attribute map for PutItem.
+func objectToItem(obj client.Object, gvk schema.GroupVersionKind, objectVersion int64, now time.Time) (map[string]dynamodbtypes.AttributeValue, error) {
+	spec, err := extractSpec(obj)
+	if err != nil {
+		return nil, err
+	}
+	status, err := extractStatus(obj)
+	if err != nil {
+		return nil, err
+	}
+	metadata, err := extractMetadata(obj)
+	if err != nil {
+		return nil, err
+	}
+
+	uid := string(obj.GetUID())
+	if uid == "" {
+		uid = uuid.New().String()
+	}
+
+	createTime := now
+	if !obj.GetCreationTimestamp().IsZero() {
+		createTime = obj.GetCreationTimestamp().Time
+	}
+
+	ns := obj.GetNamespace()
+	shard := computeGSIShard(ns)
+
+	item := map[string]dynamodbtypes.AttributeValue{
+		attrName:          &dynamodbtypes.AttributeValueMemberS{Value: obj.GetName()},
+		attrNamespace:     &dynamodbtypes.AttributeValueMemberS{Value: ns},
+		attrUID:           &dynamodbtypes.AttributeValueMemberS{Value: uid},
+		attrObjectVersion: &dynamodbtypes.AttributeValueMemberN{Value: strconv.FormatInt(objectVersion, 10)},
+		attrUpdateTime:    &dynamodbtypes.AttributeValueMemberS{Value: now.UTC().Format(time.RFC3339Nano)},
+		attrGSIShard:      &dynamodbtypes.AttributeValueMemberS{Value: shard},
+		attrCreateTime:    &dynamodbtypes.AttributeValueMemberS{Value: createTime.UTC().Format(time.RFC3339Nano)},
+		attrSpec:          &dynamodbtypes.AttributeValueMemberS{Value: string(spec)},
+		attrStatus:        &dynamodbtypes.AttributeValueMemberS{Value: string(status)},
+		attrMetadata:      &dynamodbtypes.AttributeValueMemberS{Value: string(metadata)},
+	}
+
+	if ts := obj.GetDeletionTimestamp(); ts != nil {
+		item[attrDeletionTS] = &dynamodbtypes.AttributeValueMemberS{
+			Value: ts.UTC().Format(time.RFC3339Nano),
+		}
+	}
+
+	return item, nil
+}
+
+// itemToObject reads a DynamoDB attribute map into a client.Object.
+func itemToObject(item map[string]dynamodbtypes.AttributeValue, scheme *runtime.Scheme) (client.Object, error) {
+	it, err := parseItem(item)
+	if err != nil {
+		return nil, err
+	}
+
+	gvkStr, _ := getString(item, "gvk") // optional; may not be stored
+	_ = gvkStr
+
+	// We don't store gvk in the item — the caller knows the GVK from the table.
+	// Return a partially populated crdItem; the caller fills in GVK.
+	_ = it
+	return nil, fmt.Errorf("hyperfleetdb: itemToObject requires GVK context — use itemToObjectWithGVK")
+}
+
+// itemToObjectWithGVK reads a DynamoDB attribute map into a client.Object of the given GVK.
+func itemToObjectWithGVK(item map[string]dynamodbtypes.AttributeValue, gvk schema.GroupVersionKind, scheme *runtime.Scheme) (client.Object, error) {
+	it, err := parseItem(item)
+	if err != nil {
+		return nil, err
+	}
+
+	runtimeObj, err := scheme.New(gvk)
+	if err != nil {
+		return nil, fmt.Errorf("scheme.New(%v): %w", gvk, err)
+	}
+	obj, ok := runtimeObj.(client.Object)
+	if !ok {
+		return nil, fmt.Errorf("type %T does not implement client.Object", runtimeObj)
+	}
+
+	if err := populateObjectFromItem(obj, it, gvk); err != nil {
+		return nil, err
+	}
+	return obj, nil
+}
+
+func populateObjectFromItem(obj client.Object, it *crdItem, gvk schema.GroupVersionKind) error {
+	obj.SetName(it.Name)
+	obj.SetNamespace(it.Namespace)
+	obj.SetUID(apitypes.UID(it.UID))
+	obj.SetResourceVersion(strconv.FormatInt(it.ObjectVersion, 10))
+	obj.SetCreationTimestamp(metav1.NewTime(it.CreateTime))
+	if it.DeletionTimestamp != nil {
+		dt := metav1.NewTime(*it.DeletionTimestamp)
+		obj.SetDeletionTimestamp(&dt)
+	}
+	obj.GetObjectKind().SetGroupVersionKind(gvk)
+
+	if len(it.Metadata) > 0 {
+		var sm storedMetadata
+		if err := json.Unmarshal(it.Metadata, &sm); err == nil {
+			obj.SetLabels(sm.Labels)
+			obj.SetAnnotations(sm.Annotations)
+			obj.SetOwnerReferences(sm.OwnerReferences)
+			obj.SetFinalizers(sm.Finalizers)
+			obj.SetGeneration(sm.Generation)
+		}
+	}
+
+	return injectSpecStatus(obj, it.Spec, it.Status)
+}
+
+func parseItem(item map[string]dynamodbtypes.AttributeValue) (*crdItem, error) {
+	it := &crdItem{}
+
+	it.Name, _ = getString(item, attrName)
+	it.Namespace, _ = getString(item, attrNamespace)
+	it.UID, _ = getString(item, attrUID)
+
+	if v, ok := getString(item, attrObjectVersion); ok {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err == nil {
+			it.ObjectVersion = n
+		}
+	}
+	if av, ok := item[attrObjectVersion]; ok {
+		if nv, ok := av.(*dynamodbtypes.AttributeValueMemberN); ok {
+			n, err := strconv.ParseInt(nv.Value, 10, 64)
+			if err == nil {
+				it.ObjectVersion = n
+			}
+		}
+	}
+
+	if v, ok := getString(item, attrUpdateTime); ok {
+		t, err := time.Parse(time.RFC3339Nano, v)
+		if err == nil {
+			it.UpdateTime = t
+		}
+	}
+	if v, ok := getString(item, attrCreateTime); ok {
+		t, err := time.Parse(time.RFC3339Nano, v)
+		if err == nil {
+			it.CreateTime = t
+		}
+	}
+	if v, ok := getString(item, attrDeletionTS); ok && v != "" {
+		t, err := time.Parse(time.RFC3339Nano, v)
+		if err == nil {
+			it.DeletionTimestamp = &t
+		}
+	}
+
+	if v, ok := getString(item, attrSpec); ok {
+		it.Spec = json.RawMessage(v)
+	}
+	if v, ok := getString(item, attrStatus); ok {
+		it.Status = json.RawMessage(v)
+	}
+	if v, ok := getString(item, attrMetadata); ok {
+		it.Metadata = json.RawMessage(v)
+	}
+
+	return it, nil
+}
+
+func getString(item map[string]dynamodbtypes.AttributeValue, key string) (string, bool) {
+	av, ok := item[key]
+	if !ok {
+		return "", false
+	}
+	sv, ok := av.(*dynamodbtypes.AttributeValueMemberS)
+	if !ok {
+		return "", false
+	}
+	return sv.Value, true
+}
+
+// computeGSIShard computes the GSI shard bucket string ("0"–"7") for a namespace.
+func computeGSIShard(namespace string) string {
+	h := fnvHash(namespace)
+	return strconv.Itoa(int(h) % gsiShardCount)
+}
+
+func fnvHash(s string) uint32 {
+	h := fnvNew32a()
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}
+
+// fnvNew32a returns the FNV-32a offset basis.
+func fnvNew32a() uint32 { return 2166136261 }
+
+// --- spec/status/metadata helpers (reused from old convert.go) ---
+
 func extractSpec(obj client.Object) (json.RawMessage, error) {
 	val := reflect.ValueOf(obj).Elem()
 	specField := val.FieldByName("Spec")
@@ -62,47 +371,6 @@ func extractSpec(obj client.Object) (json.RawMessage, error) {
 		return json.RawMessage(`{}`), nil
 	}
 	return json.Marshal(specField.Interface())
-}
-
-func hasFinalizers(r model.Resource) bool {
-	if len(r.Metadata) == 0 {
-		return false
-	}
-	var sm storedMetadata
-	if err := json.Unmarshal(r.Metadata, &sm); err != nil {
-		return false
-	}
-	return len(sm.Finalizers) > 0
-}
-
-func isFullyDeleted(r model.Resource) bool {
-	return r.DeletionTimestamp != nil && !hasFinalizers(r)
-}
-
-func extractSpecStatus(obj client.Object) (spec, status json.RawMessage, err error) {
-	val := reflect.ValueOf(obj).Elem()
-
-	specField := val.FieldByName("Spec")
-	if specField.IsValid() {
-		spec, err = json.Marshal(specField.Interface())
-		if err != nil {
-			return nil, nil, fmt.Errorf("marshal spec: %w", err)
-		}
-	} else {
-		spec = json.RawMessage(`{}`)
-	}
-
-	statusField := val.FieldByName("Status")
-	if statusField.IsValid() {
-		status, err = json.Marshal(statusField.Interface())
-		if err != nil {
-			return nil, nil, fmt.Errorf("marshal status: %w", err)
-		}
-	} else {
-		status = json.RawMessage(`{}`)
-	}
-
-	return spec, status, nil
 }
 
 func extractStatus(obj client.Object) (json.RawMessage, error) {
@@ -123,77 +391,6 @@ func extractMetadata(obj client.Object) (json.RawMessage, error) {
 		Generation:      obj.GetGeneration(),
 	}
 	return json.Marshal(sm)
-}
-
-func parseResourceVersion(obj client.Object) (int64, error) {
-	rv := obj.GetResourceVersion()
-	if rv == "" {
-		return 0, nil
-	}
-	if v, err := strconv.ParseInt(rv, 10, 64); err == nil {
-		return v, nil
-	}
-	// Objects delivered by watch events carry a composite RV with the object
-	// version as an "o<n>;" prefix (see pgWatcher.relay).
-	composite, err := resourceversion.Parse(rv)
-	if err != nil || composite.ObjectVersion == 0 {
-		return 0, fmt.Errorf("resource version %q carries no object version", rv)
-	}
-	return composite.ObjectVersion, nil
-}
-
-func resourceToObject(r model.Resource, scheme *runtime.Scheme) (client.Object, error) {
-	gvk, err := stringToGVK(r.GVK)
-	if err != nil {
-		return nil, err
-	}
-
-	runtimeObj, err := scheme.New(gvk)
-	if err != nil {
-		return nil, fmt.Errorf("scheme.New(%v): %w", gvk, err)
-	}
-	obj, ok := runtimeObj.(client.Object)
-	if !ok {
-		return nil, fmt.Errorf("type %T does not implement client.Object", runtimeObj)
-	}
-
-	populateObjectMeta(obj, r)
-	obj.GetObjectKind().SetGroupVersionKind(gvk)
-
-	if err := injectSpecStatus(obj, r.Spec, r.Status); err != nil {
-		return nil, err
-	}
-
-	return obj, nil
-}
-
-func populateObject(dst client.Object, r model.Resource, gvk schema.GroupVersionKind) error {
-	populateObjectMeta(dst, r)
-	dst.GetObjectKind().SetGroupVersionKind(gvk)
-	return injectSpecStatus(dst, r.Spec, r.Status)
-}
-
-func populateObjectMeta(obj client.Object, r model.Resource) {
-	obj.SetName(r.Name)
-	obj.SetNamespace(r.Namespace)
-	obj.SetUID(types.UID(r.UID.String()))
-	obj.SetResourceVersion(strconv.FormatInt(r.ObjectVersion, 10))
-	obj.SetCreationTimestamp(metav1.NewTime(r.CreatedAt))
-	if r.DeletionTimestamp != nil {
-		dt := metav1.NewTime(*r.DeletionTimestamp)
-		obj.SetDeletionTimestamp(&dt)
-	}
-
-	if len(r.Metadata) > 0 {
-		var sm storedMetadata
-		if err := json.Unmarshal(r.Metadata, &sm); err == nil {
-			obj.SetLabels(sm.Labels)
-			obj.SetAnnotations(sm.Annotations)
-			obj.SetOwnerReferences(sm.OwnerReferences)
-			obj.SetFinalizers(sm.Finalizers)
-			obj.SetGeneration(sm.Generation)
-		}
-	}
 }
 
 func injectSpecStatus(obj client.Object, spec, status json.RawMessage) error {
@@ -250,4 +447,57 @@ func setListItems(list client.ObjectList, items []client.Object) error {
 
 	itemsField.Set(slice)
 	return nil
+}
+
+// parseResourceVersion extracts the integer object version from a
+// ResourceVersion string.
+func parseResourceVersion(obj client.Object) (int64, error) {
+	rv := obj.GetResourceVersion()
+	if rv == "" {
+		return 0, nil
+	}
+	v, err := strconv.ParseInt(rv, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("resource version %q is not a valid integer: %w", rv, err)
+	}
+	return v, nil
+}
+
+// --- label set for selector matching ---
+
+type labelSet map[string]string
+
+func (ls labelSet) Has(key string) bool         { _, ok := ls[key]; return ok }
+func (ls labelSet) Get(key string) string       { return ls[key] }
+func (ls labelSet) Lookup(k string) (string, bool) { v, ok := ls[k]; return v, ok }
+
+// --- DynamoDB key builders ---
+
+func itemKey(name, namespace string) map[string]dynamodbtypes.AttributeValue {
+	return map[string]dynamodbtypes.AttributeValue{
+		attrName:      &dynamodbtypes.AttributeValueMemberS{Value: name},
+		attrNamespace: &dynamodbtypes.AttributeValueMemberS{Value: namespace},
+	}
+}
+
+// scanTableInput returns a ScanInput for a full consistent scan.
+func scanTableInput(tableName string) *dynamodb.ScanInput {
+	return &dynamodb.ScanInput{
+		TableName:      aws.String(tableName),
+		ConsistentRead: aws.Bool(true),
+	}
+}
+
+// scanSinceInput returns a ScanInput for an eventually-consistent updateTime filter scan.
+func scanSinceInput(tableName string, since time.Time) *dynamodb.ScanInput {
+	return &dynamodb.ScanInput{
+		TableName:        aws.String(tableName),
+		ConsistentRead:   aws.Bool(false),
+		FilterExpression: aws.String("updateTime > :since"),
+		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
+			":since": &dynamodbtypes.AttributeValueMemberS{
+				Value: since.UTC().Format(time.RFC3339Nano),
+			},
+		},
+	}
 }

@@ -28,7 +28,6 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	hyperfleetdb "github.com/openshift-online/rosa-hyperfleet-api/hyperfleet-db"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -76,9 +75,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	dsn := os.Getenv("POSTGRES_DSN")
-	if dsn == "" {
-		setupLog.Error(nil, "POSTGRES_DSN environment variable is required")
+	tablePrefix := os.Getenv("HYPERFLEET_DB_TABLE_PREFIX")
+	if tablePrefix == "" {
+		setupLog.Error(nil, "HYPERFLEET_DB_TABLE_PREFIX environment variable is required")
 		os.Exit(1)
 	}
 
@@ -110,11 +109,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	log := ctrl.Log.WithName("pgruntime")
+	log := ctrl.Log.WithName("hyperfleetdb")
+
+	dynamoDBClient := dynamodb.NewFromConfig(awsCfg)
 
 	mgr, err := hyperfleetdb.NewManager(hyperfleetdb.Options{
-		Scheme: scheme,
-		DSN:    dsn,
+		Scheme:      scheme,
+		DynamoDB:    dynamoDBClient,
+		TablePrefix: tablePrefix,
 		Shard: &hyperfleetdb.ShardConfig{
 			Mod:   replicaCount,
 			Owned: []int{ordinal},
@@ -126,13 +128,11 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 	})
 	if err != nil {
-		setupLog.Error(err, "Failed to create pgruntime manager")
+		setupLog.Error(err, "Failed to create hyperfleetdb manager")
 		os.Exit(1)
 	}
 
-	dynamoDBClient := dynamodb.NewFromConfig(awsCfg)
 	dynamoClient := dynamo.NewClient(dynamoDBClient)
-	streamsClient := dynamodbstreams.NewFromConfig(awsCfg)
 
 	rcfg := render.RegionalConfig{
 		BaseDomain: baseDomain,
@@ -198,7 +198,6 @@ func main() {
 
 	streamMgr := statusstream.NewManager(
 		dynamoDBClient,
-		streamsClient,
 		mgr.GetClient(),
 		[]string{dynamo.TableSuffixStatusApplyDesires, dynamo.TableSuffixStatusReadDesires},
 		func(documentID string) { eventRouter.Dispatch(documentID) },
@@ -208,7 +207,7 @@ func main() {
 	defer watchCancel()
 	go streamMgr.Run(watchCtx, 5*time.Second)
 
-	setupLog.Info("Starting pgruntime manager")
+	setupLog.Info("Starting hyperfleetdb manager")
 	if err := mgr.Start(signalCtx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
