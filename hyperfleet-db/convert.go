@@ -20,6 +20,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// clusterScopedNamespace is the sentinel stored in the DynamoDB namespace range
+// key for cluster-scoped resources (which have an empty Kubernetes namespace).
+// DynamoDB rejects empty strings in key attributes, so we substitute this value
+// on write and reverse it on read.
+const clusterScopedNamespace = "_"
+
 // DynamoDB attribute names for the CRD table schema.
 const (
 	attrName             = "name"
@@ -190,11 +196,12 @@ func objectToItem(obj client.Object, gvk schema.GroupVersionKind, objectVersion 
 	}
 
 	ns := obj.GetNamespace()
+	storedNS := namespaceToStored(ns)
 	shard := computeGSIShard(ns)
 
 	item := map[string]dynamodbtypes.AttributeValue{
 		attrName:          &dynamodbtypes.AttributeValueMemberS{Value: obj.GetName()},
-		attrNamespace:     &dynamodbtypes.AttributeValueMemberS{Value: ns},
+		attrNamespace:     &dynamodbtypes.AttributeValueMemberS{Value: storedNS},
 		attrUID:           &dynamodbtypes.AttributeValueMemberS{Value: uid},
 		attrObjectVersion: &dynamodbtypes.AttributeValueMemberN{Value: strconv.FormatInt(objectVersion, 10)},
 		attrUpdateTime:    &dynamodbtypes.AttributeValueMemberS{Value: now.UTC().Format(time.RFC3339Nano)},
@@ -282,7 +289,8 @@ func parseItem(item map[string]dynamodbtypes.AttributeValue) (*crdItem, error) {
 	it := &crdItem{}
 
 	it.Name, _ = getString(item, attrName)
-	it.Namespace, _ = getString(item, attrNamespace)
+	storedNS, _ := getString(item, attrNamespace)
+	it.Namespace = namespaceFromStored(storedNS)
 	it.UID, _ = getString(item, attrUID)
 
 	if v, ok := getString(item, attrObjectVersion); ok {
@@ -342,6 +350,25 @@ func getString(item map[string]dynamodbtypes.AttributeValue, key string) (string
 		return "", false
 	}
 	return sv.Value, true
+}
+
+// namespaceToStored converts a Kubernetes namespace to the value stored in
+// DynamoDB. Cluster-scoped resources have an empty namespace, which DynamoDB
+// rejects as a key attribute value, so we substitute clusterScopedNamespace.
+func namespaceToStored(ns string) string {
+	if ns == "" {
+		return clusterScopedNamespace
+	}
+	return ns
+}
+
+// namespaceFromStored reverses namespaceToStored: the sentinel is returned as
+// the empty string that cluster-scoped Kubernetes resources actually carry.
+func namespaceFromStored(stored string) string {
+	if stored == clusterScopedNamespace {
+		return ""
+	}
+	return stored
 }
 
 // computeGSIShard computes the GSI shard bucket string ("0"–"7") for a namespace.
@@ -476,7 +503,7 @@ func (ls labelSet) Lookup(k string) (string, bool) { v, ok := ls[k]; return v, o
 func itemKey(name, namespace string) map[string]dynamodbtypes.AttributeValue {
 	return map[string]dynamodbtypes.AttributeValue{
 		attrName:      &dynamodbtypes.AttributeValueMemberS{Value: name},
-		attrNamespace: &dynamodbtypes.AttributeValueMemberS{Value: namespace},
+		attrNamespace: &dynamodbtypes.AttributeValueMemberS{Value: namespaceToStored(namespace)},
 	}
 }
 

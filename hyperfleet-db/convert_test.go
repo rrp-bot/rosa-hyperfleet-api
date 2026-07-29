@@ -4,6 +4,7 @@ import (
 	"hash/fnv"
 	"testing"
 
+	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -187,5 +188,80 @@ func TestComputeGSIShard_MatchesShardConfigMatches(t *testing.T) {
 				ns, computeGSIShard(ns), mod, expectedShard,
 			)
 		}
+	}
+}
+
+// --- namespaceToStored / namespaceFromStored ---
+
+// TestNamespaceToStored verifies that empty namespace is replaced with the
+// sentinel and non-empty namespaces are passed through unchanged.
+func TestNamespaceToStored(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"", clusterScopedNamespace},
+		{clusterScopedNamespace, clusterScopedNamespace}, // sentinel itself is a valid namespace name
+		{"default", "default"},
+		{"openshift-monitoring", "openshift-monitoring"},
+	}
+	for _, tc := range cases {
+		got := namespaceToStored(tc.input)
+		if got != tc.want {
+			t.Errorf("namespaceToStored(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+// TestNamespaceFromStored verifies that the sentinel is reversed to "" and
+// other values are passed through unchanged.
+func TestNamespaceFromStored(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{clusterScopedNamespace, ""},
+		{"default", "default"},
+		{"openshift-monitoring", "openshift-monitoring"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		got := namespaceFromStored(tc.input)
+		if got != tc.want {
+			t.Errorf("namespaceFromStored(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+// TestNamespaceSentinel_RoundTrip verifies that namespaceToStored followed by
+// namespaceFromStored is an identity for all namespace strings (including "").
+func TestNamespaceSentinel_RoundTrip(t *testing.T) {
+	namespaces := []string{"", "default", "kube-system", "openshift-monitoring", "ns-alpha"}
+	for _, ns := range namespaces {
+		got := namespaceFromStored(namespaceToStored(ns))
+		if got != ns {
+			t.Errorf("round-trip(%q): got %q", ns, got)
+		}
+	}
+}
+
+// TestItemKey_ClusterScopedUsesNonEmptyNamespace ensures that itemKey never
+// produces an empty string for the namespace attribute — DynamoDB rejects empty
+// string key attribute values.
+func TestItemKey_ClusterScopedUsesNonEmptyNamespace(t *testing.T) {
+	key := itemKey("my-mc", "")
+	av, ok := key[attrNamespace]
+	if !ok {
+		t.Fatal("itemKey did not include namespace attribute")
+	}
+	sv, ok := av.(*dynamodbtypes.AttributeValueMemberS)
+	if !ok {
+		t.Fatalf("namespace attribute is not a string type: %T", av)
+	}
+	if sv.Value == "" {
+		t.Error("itemKey produced empty string namespace for cluster-scoped resource; DynamoDB will reject this")
+	}
+	if sv.Value != clusterScopedNamespace {
+		t.Errorf("expected sentinel %q, got %q", clusterScopedNamespace, sv.Value)
 	}
 }
