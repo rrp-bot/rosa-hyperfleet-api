@@ -41,12 +41,6 @@ spec:
             capabilities:
               drop:
                 - "ALL"
-          env:
-            - name: POSTGRES_DSN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.postgres.secretName | default "postgres-dsn" }}
-                  key: {{ .Values.postgres.secretKey | default "dsn" }}
           ports:
             - name: metrics
               containerPort: 9090

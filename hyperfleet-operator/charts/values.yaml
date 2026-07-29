@@ -8,9 +8,10 @@ image:
 awsRegion: ""
 baseDomain: ""
 
-postgres:
-  secretName: postgres-dsn
-  secretKey: dsn
+# Prefix for hyperfleet CRD DynamoDB table names (e.g. "rc01-").
+# Maps to the HYPERFLEET_DB_TABLE_PREFIX env var read by the operator binary.
+# Required — must be set via helmValues in the ArgoCD Application.
+tablePrefix: ""
 
 serviceAccount:
   create: true
@@ -26,7 +27,7 @@ resources:
     memory: 128Mi
 
 compactor:
-  enabled: true
+  enabled: false
   interval: 5m
   retention: 24h
   resources:

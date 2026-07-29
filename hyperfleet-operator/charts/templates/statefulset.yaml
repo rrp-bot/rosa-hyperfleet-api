@@ -37,11 +37,8 @@ spec:
             - --base-domain={{ required "baseDomain is required" .Values.baseDomain }}
             - --health-probe-bind-address=:8081
           env:
-            - name: POSTGRES_DSN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.postgres.secretName | default "postgres-dsn" }}
-                  key: {{ .Values.postgres.secretKey | default "dsn" }}
+            - name: HYPERFLEET_DB_TABLE_PREFIX
+              value: {{ required "tablePrefix is required" .Values.tablePrefix | quote }}
             - name: REPLICA_COUNT
               value: {{ .Values.replicaCount | quote }}
           ports:
