@@ -185,7 +185,7 @@ func objectToItem(obj client.Object, gvk schema.GroupVersionKind, objectVersion 
 	}
 
 	createTime := now
-	if !obj.GetCreationTimestamp().IsZero() {
+	if !obj.GetCreationTimestamp().Time.IsZero() {
 		createTime = obj.GetCreationTimestamp().Time
 	}
 

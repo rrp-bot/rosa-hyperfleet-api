@@ -127,7 +127,7 @@ func (c *dynClient) Create(ctx context.Context, obj client.Object, opts ...clien
 	if obj.GetUID() == "" {
 		obj.SetUID(apitypes.UID(uuid.New().String()))
 	}
-	if obj.GetCreationTimestamp().IsZero() {
+	if obj.GetCreationTimestamp().Time.IsZero() {
 		obj.SetCreationTimestamp(metav1.NewTime(now))
 	}
 
@@ -279,6 +279,10 @@ func (c *dynClient) Patch(_ context.Context, _ client.Object, _ client.Patch, _ 
 	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "Patch is not supported by hyperfleetdb; use Update")
 }
 
+func (c *dynClient) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "Apply is not supported by hyperfleetdb; use Create/Update")
+}
+
 func (c *dynClient) DeleteAllOf(_ context.Context, _ client.Object, _ ...client.DeleteAllOfOption) error {
 	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "DeleteAllOf is not supported by hyperfleetdb")
 }
@@ -322,12 +326,20 @@ type dynStatusWriter struct {
 	dc *dynClient
 }
 
+func (sw *dynStatusWriter) Create(_ context.Context, _ client.Object, _ client.Object, _ ...client.SubResourceCreateOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "Status().Create() is not supported by hyperfleetdb")
+}
+
 func (sw *dynStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 	return sw.dc.Update(ctx, obj)
 }
 
 func (sw *dynStatusWriter) Patch(_ context.Context, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
 	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "Status().Patch() is not supported by hyperfleetdb; use Status().Update()")
+}
+
+func (sw *dynStatusWriter) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.SubResourceApplyOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, "Status().Apply() is not supported by hyperfleetdb; use Status().Update()")
 }
 
 // --- dynSubResourceClient ---
@@ -354,6 +366,10 @@ func (s *dynSubResourceClient) Update(ctx context.Context, obj client.Object, op
 
 func (s *dynSubResourceClient) Patch(_ context.Context, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
 	return apierrors.NewMethodNotSupported(schema.GroupResource{}, fmt.Sprintf("SubResource(%q).Patch() is not supported by hyperfleetdb", s.sub))
+}
+
+func (s *dynSubResourceClient) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.SubResourceApplyOption) error {
+	return apierrors.NewMethodNotSupported(schema.GroupResource{}, fmt.Sprintf("SubResource(%q).Apply() is not supported by hyperfleetdb", s.sub))
 }
 
 // --- list helpers ---
